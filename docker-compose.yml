@@ -1,0 +1,523 @@
+name: kafka-flink-lab
+
+services:
+
+  # ============================================================
+  # KAFKA - KRaft
+  # ============================================================
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.13
+    container_name: kafka
+    hostname: kafka
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      # --------------------------------------------------------
+      # KRaft
+      # --------------------------------------------------------
+
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # --------------------------------------------------------
+      # Listeners
+      # --------------------------------------------------------
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        CONTROLLER:PLAINTEXT,
+        INTERNAL:PLAINTEXT,
+        EXTERNAL:PLAINTEXT
+
+      KAFKA_LISTENERS: >
+        INTERNAL://0.0.0.0:29092,
+        CONTROLLER://0.0.0.0:29093,
+        EXTERNAL://0.0.0.0:9092
+
+      KAFKA_ADVERTISED_LISTENERS: >
+        INTERNAL://kafka:29092,
+        EXTERNAL://localhost:9092
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # --------------------------------------------------------
+      # Single broker
+      # --------------------------------------------------------
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # KAFKA INIT
+  # ============================================================
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.13
+    container_name: kafka-init
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    entrypoint:
+      - /bin/bash
+      - -c
+
+    command:
+      - |
+        set -e
+
+        echo ""
+        echo "============================================================"
+        echo " Kafka / Flink PIX Lab"
+        echo " Criando tópicos"
+        echo "============================================================"
+        echo ""
+
+        create_topic() {
+
+          TOPIC_NAME=$$1
+          PARTITIONS=$${2:-3}
+
+          echo "-> $$TOPIC_NAME"
+
+          kafka-topics \
+            --bootstrap-server kafka:29092 \
+            --create \
+            --if-not-exists \
+            --topic "$$TOPIC_NAME" \
+            --partitions "$$PARTITIONS" \
+            --replication-factor 1
+        }
+
+        # ======================================================
+        # SOURCES
+        # ======================================================
+
+        create_topic pix.autorizacao.eventos 3
+        create_topic pix.liquidacao.eventos 3
+        create_topic pix.antifraude.eventos 3
+
+        # ======================================================
+        # TÓPICOS DE ESTUDO
+        # ======================================================
+
+        create_topic pix.autorizacao.aprovada 3
+        create_topic pix.autorizacao.metricas 3
+
+        # ======================================================
+        # OUTPUT DO FLUXO PIX
+        # ======================================================
+
+        create_topic pix.transacao.consolidada 3
+        create_topic pix.transacao.incompleta 3
+        create_topic pix.transacao.late-events 3
+
+        # ======================================================
+        # LISTAGEM
+        # ======================================================
+
+        echo ""
+        echo "============================================================"
+        echo " Tópicos disponíveis"
+        echo "============================================================"
+        echo ""
+
+        kafka-topics \
+          --bootstrap-server kafka:29092 \
+          --list
+
+        echo ""
+        echo "Kafka initialization concluída."
+        echo ""
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # SCHEMA REGISTRY
+  # ============================================================
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.13
+    container_name: schema-registry
+    hostname: schema-registry
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: >
+        PLAINTEXT://kafka:29092
+
+      SCHEMA_REGISTRY_LISTENERS: >
+        http://0.0.0.0:8081
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # KAFKA UI
+  # ============================================================
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+      schema-registry:
+        condition: service_started
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-kraft
+
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: >
+        http://schema-registry:8081
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # PIX DATAGEN
+  # ============================================================
+
+  pix-datagen:
+    image: python:3.12-slim
+    container_name: pix-datagen
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+      kafka-init:
+        condition: service_completed_successfully
+
+    working_dir: /app
+
+    volumes:
+      - ./datagen:/app
+
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+
+      TRANSACTION_INTERVAL_MS: 1000
+
+      DUPLICATE_RATE: "0.10"
+
+      MISSING_EVENT_RATE: "0.10"
+
+      LATE_EVENT_RATE: "0.10"
+
+      MAX_ARRIVAL_DELAY_SECONDS: "12"
+
+    command: >
+      sh -c "
+      pip install --no-cache-dir confluent-kafka==2.6.1 &&
+      python -u pix_datagen.py
+      "
+
+    restart: unless-stopped
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # FLINK JOBMANAGER
+  # ============================================================
+
+  jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+
+    container_name: flink-jobmanager
+    hostname: jobmanager
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+      kafka-init:
+        condition: service_completed_successfully
+
+    ports:
+      # Host -> Flink REST/Web UI
+      - "8082:8081"
+
+    command: jobmanager
+
+    environment:
+      FLINK_PROPERTIES: |
+        # ------------------------------------------------------
+        # RPC
+        # ------------------------------------------------------
+
+        jobmanager.rpc.address: jobmanager
+
+        # ------------------------------------------------------
+        # REST
+        #
+        # rest.address:
+        #   endereço utilizado pelos clientes dentro da
+        #   rede Docker.
+        #
+        # rest.bind-address:
+        #   JobManager escuta em todas as interfaces.
+        # ------------------------------------------------------
+
+        rest.address: jobmanager
+        rest.bind-address: 0.0.0.0
+        rest.port: 8081
+
+        # ------------------------------------------------------
+        # Runtime
+        # ------------------------------------------------------
+
+        parallelism.default: 3
+
+        # ------------------------------------------------------
+        # State
+        # ------------------------------------------------------
+
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+
+      - flink-savepoints:/opt/flink/savepoints
+
+      - ./flink/sql:/opt/flink/sql
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # FLINK TASKMANAGER
+  # ============================================================
+
+  taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+
+    container_name: flink-taskmanager
+    hostname: taskmanager
+
+    depends_on:
+      jobmanager:
+        condition: service_started
+
+    command: taskmanager
+
+    environment:
+      FLINK_PROPERTIES: |
+        # ------------------------------------------------------
+        # JobManager discovery
+        # ------------------------------------------------------
+
+        jobmanager.rpc.address: jobmanager
+
+        # ------------------------------------------------------
+        # REST endpoint do cluster
+        # ------------------------------------------------------
+
+        rest.address: jobmanager
+        rest.port: 8081
+
+        # ------------------------------------------------------
+        # Runtime
+        # ------------------------------------------------------
+
+        taskmanager.numberOfTaskSlots: 4
+
+        parallelism.default: 3
+
+        # ------------------------------------------------------
+        # State
+        # ------------------------------------------------------
+
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+
+      - flink-savepoints:/opt/flink/savepoints
+
+      - ./flink/sql:/opt/flink/sql
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # FLINK SQL CLIENT
+  #
+  # Uso:
+  #
+  # docker compose run --rm sql-client
+  #
+  # O init.sql será carregado automaticamente.
+  #
+  # IMPORTANTE:
+  #
+  # rest.address precisa apontar para "jobmanager".
+  #
+  # Não usar 0.0.0.0 aqui.
+  # ============================================================
+
+  sql-client:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+
+    profiles:
+      - tools
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+      kafka-init:
+        condition: service_completed_successfully
+
+      jobmanager:
+        condition: service_started
+
+      taskmanager:
+        condition: service_started
+
+    environment:
+      FLINK_PROPERTIES: |
+        # ------------------------------------------------------
+        # Cluster remoto que receberá os Jobs
+        # ------------------------------------------------------
+
+        jobmanager.rpc.address: jobmanager
+
+        rest.address: jobmanager
+        rest.port: 8081
+
+        # ------------------------------------------------------
+        # Runtime default da sessão
+        # ------------------------------------------------------
+
+        parallelism.default: 3
+
+    command:
+      - /opt/flink/bin/sql-client.sh
+      - -i
+      - /opt/flink/sql/init.sql
+
+    stdin_open: true
+    tty: true
+
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+
+    networks:
+      - kafka-flink
+
+
+  # ============================================================
+  # POSTGRES
+  # ============================================================
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+
+    profiles:
+      - storage
+
+    ports:
+      - "5432:5432"
+
+    environment:
+      POSTGRES_DB: flink
+      POSTGRES_USER: flink
+      POSTGRES_PASSWORD: flink
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    networks:
+      - kafka-flink
+
+
+# ==============================================================
+# NETWORKS
+# ==============================================================
+
+networks:
+
+  kafka-flink:
+    name: kafka-flink
+    driver: bridge
+
+
+# ==============================================================
+# VOLUMES
+# ==============================================================
+
+volumes:
+
+  kafka-data:
+
+  flink-checkpoints:
+
+  flink-savepoints:
+
+  postgres-data:
