@@ -6,7 +6,7 @@ SELECT
 FROM TABLE(
     TUMBLE(
         TABLE autorizacao,
-        DESCRIPTOR(rowtime),
+        DESCRIPTOR(event_ts),
         INTERVAL '15' SECOND
     )
 )
@@ -24,7 +24,7 @@ SELECT
 FROM TABLE(
     TUMBLE(
         TABLE autorizacao,
-        DESCRIPTOR(rowtime),
+        DESCRIPTOR(event_ts),
         INTERVAL '15' SECOND
     )
 )

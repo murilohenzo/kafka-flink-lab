@@ -8,7 +8,7 @@
 --
 -- Conceitos exercitados:
 --   - Event Time
---   - ROWTIME (`event_ts`)
+--   - event_ts (`event_ts`)
 --   - Watermark da tabela de origem
 --   - TUMBLE Window TVF
 --   - Window Aggregation
@@ -96,7 +96,7 @@ FROM TABLE(
     TUMBLE(
         TABLE autorizacao,
 
-        -- Coluna ROWTIME utilizada para atribuir cada evento
+        -- Coluna event_ts utilizada para atribuir cada evento
         -- à sua respectiva janela de EVENT TIME.
         DESCRIPTOR(event_ts),
 

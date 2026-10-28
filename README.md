@@ -2,7 +2,7 @@
 
 **Event time, watermarks, rowtime, Window TVFs, OVER, joins e correlação PIX**
 
-**Versão:** 2.0 · **Revisão:** 15 de setembro de 2026  
+**Versão:** 2.1 · **Revisão:** 27 de outubro de 2026  
 **Ambiente principal:** Apache Flink 1.20, Kafka em KRaft e Schema Registry locais.  
 **Destino de evolução:** Confluent Cloud for Apache Flink, com diferenças identificadas ao longo do texto.  
 **Público:** desenvolvedores, engenharia de dados, arquitetura e plataforma de eventos.
@@ -11,7 +11,7 @@
 
 Este guia apresenta um percurso de estudo de Flink SQL: começa pela leitura de eventos Kafka, explica como tabelas dinâmicas representam um fluxo e introduz tempo de evento, watermarks e estado. Em seguida, compara agregações por janela, análises por linha com OVER e diferentes famílias de joins. O caso PIX conecta os conceitos à correlação entre autorização, liquidação e antifraude, com regras explícitas para presença das evidências, seleção de payloads, fechamento e eventos tardios. A parte operacional cobre SQL Client, planos de execução, Dashboard, Avro, checkpoints, recuperação e replay. Os exemplos priorizam SQL e distinguem o Flink 1.20 local das capacidades documentadas no serviço da Confluent.
 
-**Como interpretar os exemplos:** os contratos PIX, os intervalos de 5 e 15 segundos, os nomes dos objetos e os resultados esperados são propostas didáticas deste projeto. As fontes oficiais sustentam as capacidades dos operadores. As queries foram revisadas documentalmente; a compilação e a execução no cluster do usuário permanecem como etapas de validação. O Docker Compose integral e a implementação atual do datagen não foram fornecidos nesta revisão.
+**Como interpretar os exemplos:** os contratos PIX, os intervalos de 5 e 15 segundos e os resultados esperados são propostas didáticas do laboratório. A revisão 2.1 alinha o bootstrap SQL, os estudos, os pipelines e o produtor ao mesmo contrato. O Compose local continua sendo um laboratório de nó único; as queries e o build precisam ser executados no ambiente antes de tratar os resultados como comprovados.
 
 ## Lista de siglas
 
@@ -38,6 +38,7 @@ Este guia apresenta um percurso de estudo de Flink SQL: começa pela leitura de 
 ## Índice
 
 1. [Objetivo e percurso de leitura](#1-objetivo-e-percurso-de-leitura)
+   1.1. [Mapa de decisão das abordagens Flink](#11-mapa-de-decisão-das-abordagens-flink)
 2. [Ajustes conceituais da revisão](#2-ajustes-conceituais-da-revisão)
 3. [Arquitetura, serviços e arquivos](#3-arquitetura-serviços-e-arquivos)
 4. [Preparação do ambiente e SQL Client](#4-preparação-do-ambiente-e-sql-client)
@@ -58,6 +59,7 @@ Este guia apresenta um percurso de estudo de Flink SQL: começa pela leitura de 
 19. [EXPLAIN, Dashboard, estado e backpressure](#19-explain-dashboard-estado-e-backpressure)
 20. [Checkpoints, recovery e replay](#20-checkpoints-recovery-e-replay)
 21. [De/para para Confluent Cloud](#21-depara-para-confluent-cloud)
+   21.5. [Materialized Tables, CTAS e Statements](#215-materialized-tables-ctas-e-statements)
 22. [Roteiro de estudos e resultados esperados](#22-roteiro-de-estudos-e-resultados-esperados)
 23. [Diagnóstico dos erros do projeto](#23-diagnóstico-dos-erros-do-projeto)
 24. [Considerações finais](#24-considerações-finais)
@@ -84,6 +86,30 @@ A trilha principal usa **janelas alinhadas de 15 segundos**. Ela permite estudar
 | Dedup e joins | Qual a identidade, a cardinalidade e a relação temporal? |
 | Pipelines PIX | Minha saída representa presença, payload ou decisão final? |
 | Operação e replay | Consigo verificar, recuperar e reconstruir esse resultado? |
+
+### 1.1. Mapa de decisão das abordagens Flink
+
+Comece pela pergunta do produto. O operador vem depois: a query correta depende de se você precisa de uma linha por evento, de uma decisão por janela, de uma correlação limitada no tempo ou da versão atual de uma chave.
+
+| Abordagem | Pergunta que responde | Quando usar no laboratório | Atenção principal |
+| --- | --- | --- | --- |
+| `SELECT` / `WHERE` / projeção | “Quais eventos válidos chegaram?” | Inspecionar e filtrar AUTH, LIQ ou FRAUD antes de agregar | Não deduplica; filtros descartam linhas se não houver saída de rejeitados |
+| Agregação contínua (`GROUP BY`) | “Qual é o total atual por chave?” | Contagem ou soma sempre atualizada por status | O estado pode crescer sem limite temporal; o sink deve aceitar updates, normalmente upsert |
+| `TUMBLE` | “Qual foi o resultado em cada bucket fixo?” | Contar autorizações ou decidir presenças em `[início, fim)` de 15 s | Janelas são alinhadas ao relógio; duas evidências da mesma transação podem cair em buckets diferentes |
+| `HOP` | “Qual é a tendência em janelas que avançam frequentemente?” | Métricas móveis; tamanho 15 s com novo cálculo a cada 5 s | Um evento aparece em várias janelas e multiplica estado/custo |
+| `CUMULATE` | “Como o acumulado cresce desde um início comum?” | Comparar valores acumulados em 5, 10 e 15 s dentro de um período | Não representa janelas deslizantes arbitrárias; declare o início e o máximo |
+| `SESSION` | “Quanto dura uma atividade até haver silêncio?” | Agrupar atividade por chave quando um gap de event time encerra a sessão | Novos eventos podem estender/reunir sessões; gap não é um deadline fixo |
+| `OVER` | “Qual era a soma/contagem ao redor de cada evento?” | Saldo ou contagem móvel por transação com `RANGE` ou `ROWS` | Emite resultado por linha; `RANGE` agrupa peers com o mesmo timestamp |
+| Deduplicação / Top-1 | “Qual cópia ou versão fica vigente?” | Selecionar um evento por `event_id` ou por maior `event_version` | ID de evento identifica retransmissão; versão e desempate são regras de negócio distintas |
+| Regular Join | “Quais linhas da mesma chave combinam?” | Demonstrar join sem horizonte temporal ou relacionar fatos estáticos | Estado pode crescer indefinidamente e duplicatas multiplicam combinações |
+| Interval Join | “Quais fatos ocorreram dentro do prazo relativo a uma âncora?” | Correlacionar LIQ/FRAUD com AUTH em um intervalo event-time explícito | A âncora e os limites inclusivo/exclusivo definem o significado |
+| Window Join | “Quais fatos caíram no mesmo bucket?” | Montar payload das origens quando aceitar a semântica de janela alinhada | Duas transações próximas podem se separar na fronteira; múltiplas versões geram várias linhas |
+| Temporal Join | “Qual versão da dimensão valia no instante do fato?” | Enriquecer eventos com cadastro versionado por event time | A tabela dimensão precisa manter histórico e chave temporal compatíveis |
+| Lookup Join | “Qual é o valor atual no sistema externo?” | Consulta pontual a PostgreSQL ou outro provedor | Consulta externa e cache não equivalem a reproduzir o passado histórico |
+| Window Top-N | “Quais são os maiores N dentro de cada janela encerrada?” | Ranking de risco ou volume por período | O ranking final depende do fechamento da janela |
+| `MATCH_RECOGNIZE` | “Aconteceu uma sequência ordenada de eventos?” | Tentativas AUTH seguidas por LIQ/FRAUD quando a ordem é parte da regra | Não é a forma mais simples de testar mera presença de origens |
+
+Regra prática: para **métrica móvel por evento**, comece por `OVER`; para **resumo fechado por período**, por Window TVF + agregação; para **correlação por transação**, defina primeiro âncora e prazo e escolha Interval Join, Window Join ou estado/timer conforme a regra. Não use `TUMBLE` como substituto de prazo individual.
 
 ## 2. Ajustes conceituais da revisão
 
@@ -120,8 +146,8 @@ flowchart TD
     F --> N
     N --> W["Agregação por janela"]
     W --> D["Decisão final de presença"]
-    D --> C["pix.transacao.consolidada"]
-    D --> I["pix.transacao.incompleta"]
+    D --> C["pix.transacao.consolidada.presenca.v2"]
+    D --> I["pix.transacao.incompleta.presenca.v2"]
     N -. "Observação em outro ponto do plano" .-> O["Diagnóstico de atraso"]
     O --> T["pix.transacao.late-events"]
 ```
@@ -143,21 +169,22 @@ Dentro de um container, `localhost` é o próprio container. Por isso, as tabela
 
 O PostgreSQL não é dependência da trilha principal. Só é necessário para um exercício que escolha uma fonte externa de lookup.
 
-### 3.3. Organização proposta
+### 3.3. Organização do repositório
 
 | Caminho relativo ao projeto | Responsabilidade |
 | --- | --- |
 | `docker-compose.yml` | Serviços, rede, portas, healthchecks e volumes |
 | `datagen/pix_datagen.py` | Geração de fatos, duplicatas e cenários temporais |
-| `datagen/schemas/` | Contratos Avro, quando essa trilha for ativada |
+| `datagen/pix_fixture_producer.py` | Casos determinísticos e progresso controlado das partições |
+| `datagen/schemas/` | Contratos Avro usados no exercício com Schema Registry |
+| `datagen/requirements.txt` e `datagen/Dockerfile` | Dependências fixadas e imagem reproduzível do produtor |
 | `flink/Dockerfile` | Runtime e dependências compatíveis de conectores/formatos |
-| `flink/sql/init.sql` | Configurações, fontes e sinks da sessão |
-| `flink/sql/studies/` | Queries exploratórias |
+| `flink/sql/init.sql` | Configurações, fontes, sinks e view normalizada da sessão |
+| `flink/studies/` | Queries exploratórias organizadas por janelas, joins e state |
 | `flink/sql/pipelines/` | Queries que escrevem resultados continuamente |
-| `flink/sql/cloud/` | Exemplos específicos do SaaS |
-| `flink/sql/fixtures/` | Entradas controladas e resultados esperados |
+| `README.md` | Exemplos Cloud, critérios de escolha e resultados esperados |
 
-Os blocos SQL são identificados pelas seções e pelo roteiro da seção 22. Para executá-los como arquivos, salve-os nos caminhos indicados. O mount do SQL Client deve disponibilizar `./flink/sql` em `/opt/flink/sql`.
+Os arquivos de `flink/studies/` são consultas de leitura: escolha uma query por vez e execute-a no SQL Client depois de carregar `init.sql`. Os arquivos em `flink/sql/pipelines/` submetem jobs contínuos e escrevem nos sinks declarados no bootstrap.
 
 ## 4. Preparação do ambiente e SQL Client
 
@@ -193,7 +220,7 @@ volumes:
 
 O volume nomeado também precisa ser declarado no Compose e montado nos serviços que persistem/restauram estado. Não basta montar a pasta apenas no SQL Client.
 
-**SQL sem JAR de aplicação:** os pipelines são escritos em SQL, sem empacotar lógica de negócio Java. O runtime ainda precisa dos JARs dos conectores e formatos. A documentação do SQL Client descreve os bundles de dependências; escolha artefatos compatíveis com a série 1.20 e evite versões duplicadas no classpath. [Dependências do SQL Client][F02]
+**SQL sem JAR de aplicação:** os pipelines são escritos em SQL, sem empacotar lógica de negócio Java. A imagem local inclui o conector Kafka `3.4.0-1.20` e os formatos Avro/Confluent Avro `1.20.3`; JobManager, TaskManager e SQL Client usam a mesma imagem. O Compose também configura checkpoints a cada 10 segundos e restart fixo de três tentativas. Isso permite estudar recuperação quando um checkpoint completou e o volume está disponível; não transforma o cluster de nó único em HA. [Dependências do SQL Client][F02]
 
 ### 4.2. Criar os tópicos antes dos estudos
 
@@ -208,9 +235,10 @@ for topic in \
   pix.antifraude.eventos \
   pix.autorizacao.aprovada \
   pix.autorizacao.metricas \
-  pix.transacao.consolidada \
-  pix.transacao.incompleta \
-  pix.transacao.late-events
+  pix.transacao.consolidada.presenca.v2 \
+  pix.transacao.incompleta.presenca.v2 \
+  pix.transacao.late-events \
+  pix.autorizacao.eventos.avro
 do
   docker compose exec -T kafka kafka-topics \
     --bootstrap-server kafka:29092 \
@@ -302,9 +330,9 @@ Campos específicos:
 | --- | --- | --- |
 | Autorização | `AUTHORIZATION` | `valor DECIMAL(12,2)`, `status_autorizacao STRING` |
 | Liquidação | `SETTLEMENT` | `status_liquidacao STRING` |
-| Antifraude | `ANTIFRAUD` | `score_risco INT`, `status_antifraude STRING` |
+| Antifraude | `FRAUD` | `score_risco DOUBLE`, `status_antifraude STRING` |
 
-Se o datagen atual usa outros valores de `event_type`, faça o de/para na normalização. Os literais acima são convenções deste guia.
+O datagen e os DDLs do repositório usam esses literais diretamente; a view `pix_evidencias` no `init.sql` os normaliza para `AUTH`, `LIQ` e `FRAUD`. Se outro produtor usar valores diferentes, faça o de/para na view e valide uma mensagem de cada origem antes de iniciar a correlação.
 
 **Adaptação do ambiente existente:** o histórico do projeto inclui `produced_at` como TIMESTAMP em algumas versões. Execute `DESCRIBE` e inspecione a mensagem. `TO_TIMESTAMP_LTZ(produced_at, 3)` só deve ser usado aqui se `produced_at` for numérico em milissegundos. Para um TIMESTAMP já interpretado corretamente, use a própria coluna; para uma string, defina o parsing e o fuso do contrato. Não altere apenas o DDL sobre mensagens incompatíveis.
 
@@ -344,7 +372,7 @@ SET 'table.exec.source.idle-timeout' = '30 s';
 
 SET 'execution.checkpointing.interval' = '10 s';
 SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
-SET 'execution.checkpointing.dir' = 'file:///opt/flink/checkpoints';
+SET 'state.checkpoints.dir' = 'file:///opt/flink/checkpoints';
 SET 'execution.checkpointing.externalized-checkpoint-retention'
   = 'RETAIN_ON_CANCELLATION';
 
@@ -428,7 +456,7 @@ CREATE TABLE antifraude (
     event_id STRING,
     event_type STRING,
     event_version INT,
-    score_risco INT,
+    score_risco DOUBLE,
     status_antifraude STRING,
     event_time BIGINT,
     produced_at BIGINT,
@@ -493,7 +521,7 @@ FROM antifraude
 WHERE id_transacao_pix IS NOT NULL
   AND event_id IS NOT NULL
   AND event_time IS NOT NULL
-  AND event_type = 'ANTIFRAUD';
+  AND event_type = 'FRAUD';
 ```
 
 A normalização não é deduplicação. Os filtros também não formam uma quarentena: linhas rejeitadas deixam de participar da view. Se for necessário auditá-las, crie uma saída com o motivo da rejeição.
@@ -1448,8 +1476,8 @@ CREATE TABLE autorizacao_aprovada (
 );
 
 CREATE TABLE autorizacao_metricas (
-    window_start TIMESTAMP(3),
-    window_end TIMESTAMP(3),
+    window_start TIMESTAMP_LTZ(3),
+    window_end TIMESTAMP_LTZ(3),
     quantidade BIGINT,
     valor_total DECIMAL(38, 2)
 ) WITH (
@@ -1462,8 +1490,8 @@ CREATE TABLE autorizacao_metricas (
 
 CREATE TABLE transacao_consolidada (
     id_transacao_pix STRING,
-    window_start TIMESTAMP(3),
-    window_end TIMESTAMP(3),
+    window_start TIMESTAMP_LTZ(3),
+    window_end TIMESTAMP_LTZ(3),
     tem_auth INT,
     tem_liq INT,
     tem_fraud INT,
@@ -1475,7 +1503,7 @@ CREATE TABLE transacao_consolidada (
     emitido_em TIMESTAMP_LTZ(3)
 ) WITH (
     'connector' = 'kafka',
-    'topic' = 'pix.transacao.consolidada',
+    'topic' = 'pix.transacao.consolidada.presenca.v2',
     'properties.bootstrap.servers' = 'kafka:29092',
     'key.format' = 'raw',
     'key.fields' = 'id_transacao_pix',
@@ -1487,7 +1515,7 @@ CREATE TABLE transacao_consolidada (
 CREATE TABLE transacao_incompleta
 WITH (
     'connector' = 'kafka',
-    'topic' = 'pix.transacao.incompleta',
+    'topic' = 'pix.transacao.incompleta.presenca.v2',
     'properties.bootstrap.servers' = 'kafka:29092',
     'key.format' = 'raw',
     'key.fields' = 'id_transacao_pix',
@@ -1497,7 +1525,7 @@ WITH (
 )
 LIKE transacao_consolidada (EXCLUDING OPTIONS);
 
-CREATE TABLE transacao_late (
+CREATE TABLE transacao_late_events (
     id_transacao_pix STRING,
     event_id STRING,
     origem STRING,
@@ -1519,7 +1547,7 @@ CREATE TABLE transacao_late (
 
 **Contrato de saída desta revisão:** `transacao_consolidada` e `transacao_incompleta` armazenam decisões de presença. Não transportam o payload completo das três fontes. O Window Join da seção 13.5 mostra a outra projeção, com valor, status e IDs individuais.
 
-Se o tópico existente já contém o payload da versão anterior, publique este novo contrato em tópicos versionados, por exemplo `pix.transacao.consolidada.presenca.v2` e `pix.transacao.incompleta.presenca.v2`, ajustando criação e DDL. Não misture schemas distintos no mesmo fluxo sem uma migração explícita.
+Para evitar misturar contratos, esta revisão publica nos tópicos `pix.transacao.consolidada.presenca.v2` e `pix.transacao.incompleta.presenca.v2`. Os tópicos sem sufixo `.presenca.v2` permanecem como legados no Compose e não são escritos pelos pipelines atuais.
 
 Os sinks começam com `at-least-once` para deixar a garantia visível. A seção 20.2 mostra como estudar entrega transacional; `execution.checkpointing.mode = EXACTLY_ONCE` não altera sozinho a configuração desses sinks.
 
@@ -1542,7 +1570,8 @@ SELECT
     produced_at,
     CURRENT_TIMESTAMP
 FROM autorizacao
-WHERE status_autorizacao = 'APROVADA';
+WHERE event_type = 'AUTHORIZATION'
+  AND status_autorizacao = 'APROVADA';
 ```
 
 O pipeline preserva o timestamp original de produção e acrescenta `processed_at`. A versão anterior substituía uma coluna temporal por `CURRENT_TIMESTAMP` sem explicitar se isso sobrescrevia `produced_at`.
@@ -1767,12 +1796,12 @@ Exemplo: com watermark em 12:00:10, um evento de 12:00:06 está atrás do waterm
 
 ### 16.2. Captura diagnóstica local em SQL
 
-Arquivo `pipelines/04-late-diagnostic.sql`, dependente de `pix_evidencias` e `transacao_late`:
+Arquivo `pipelines/04-late-diagnostic.sql`, dependente de `pix_evidencias` e `transacao_late_events`:
 
 ```sql
 SET 'pipeline.name' = 'pix-late-diagnostic-v2';
 
-INSERT INTO transacao_late
+INSERT INTO transacao_late_events
 SELECT
     id_transacao_pix,
     event_id,
@@ -1931,7 +1960,7 @@ Na forma clássica baseada em schema ID no payload, o wire format inclui byte de
 
 ### 18.2. Usar um tópico separado
 
-Crie `pix.autorizacao.eventos.avro` para o estudo. Mantenha os tópicos JSON da trilha principal com seu formato original. Trocar o DDL para Avro sobre um histórico JSON causará erro de desserialização.
+O `kafka-init` já cria `pix.autorizacao.eventos.avro`. Mantenha os tópicos JSON da trilha principal com seu formato original: trocar o DDL para Avro sobre um histórico JSON causa erro de desserialização.
 
 ```bash
 docker compose exec kafka kafka-topics \
@@ -1944,7 +1973,7 @@ docker compose exec kafka kafka-topics \
 
 ### 18.3. Contrato Avro de autorização
 
-Arquivo `datagen/schemas/authorization-event.avsc`:
+O contrato executável está em `datagen/schemas/authorization-event.avsc` e corresponde aos campos físicos abaixo:
 
 ```json
 {
@@ -1999,7 +2028,7 @@ O subject `<topic>-value` corresponde à estratégia de nomeação por tópico a
 
 ### 18.5. Produzir Avro de verdade
 
-Exemplo de `datagen/produce_authorization_avro.py`. Requer o cliente Python Confluent com dependências Avro instaladas. [API Python e AvroSerializer][P03]
+O produtor pronto para executar está em `datagen/produce_authorization_avro.py`; a dependência `confluent-kafka[avro]` já é fixada na imagem do datagen. [API Python e AvroSerializer][P03]
 
 ```python
 import os
@@ -2061,7 +2090,15 @@ if pending or delivery_errors:
 print(event["event_id"])
 ```
 
-No host, os defaults apontam para as portas publicadas. Dentro do Docker, configure `PIX_BOOTSTRAP_SERVERS=kafka:29092` e `PIX_SCHEMA_REGISTRY_URL=http://schema-registry:8081`. O script precisa estar disponível no container escolhido.
+No host, os defaults apontam para as portas publicadas. Dentro do Docker, configure `PIX_BOOTSTRAP_SERVERS=kafka:29092` e `PIX_SCHEMA_REGISTRY_URL=http://schema-registry:8081`. Execute o produtor no container que instala a dependência opcional `confluent-kafka[avro]`:
+
+```bash
+docker compose run --rm \
+  -e PIX_BOOTSTRAP_SERVERS=kafka:29092 \
+  -e PIX_SCHEMA_REGISTRY_URL=http://schema-registry:8081 \
+  pix-datagen \
+  python -u produce_authorization_avro.py
+```
 
 ### 18.6. Consumir pelo Flink
 
@@ -2087,7 +2124,7 @@ CREATE TABLE autorizacao_avro (
     'properties.group.id' = 'pix-lab-auth-avro-v2',
     'scan.startup.mode' = 'earliest-offset',
     'format' = 'avro-confluent',
-    'avro-confluent.url' = 'http://schema-registry:8081'
+    'value.avro-confluent.url' = 'http://schema-registry:8081'
 );
 ```
 
@@ -2285,7 +2322,7 @@ Para consumir a saída confirmada:
 ```bash
 docker compose exec kafka kafka-console-consumer \
   --bootstrap-server kafka:29092 \
-  --topic pix.transacao.consolidada \
+  --topic pix.transacao.consolidada.presenca.v2 \
   --from-beginning \
   --consumer-property isolation.level=read_committed
 ```
@@ -2367,7 +2404,7 @@ O de/para preserva conceitos, não promete equivalência de todas as opções ou
 
 ### 21.2. Valores padrão não são o contrato PIX
 
-Na documentação Cloud consultada em 15/09/2026, a estratégia padrão usa tolerância de **180 ms por partição Kafka**, sobre `$rowtime`. Isso não reproduz a tolerância de 5 s do exemplo local nem define um horizonte de correlação de 15 s.
+Na documentação Cloud consultada em 27/10/2026, a estratégia padrão usa tolerância de **180 ms por partição Kafka**, sobre `$rowtime`. Isso não reproduz a tolerância de 5 s do exemplo local nem define um horizonte de correlação de 15 s.
 
 A documentação também descreve progressive idleness, começando em 10 s e aumentando com a idade do statement até 5 min. Valide o comportamento ou configure a opção do serviço; não transplante os 30 s locais por suposição. Pelo menos uma partição precisa continuar recebendo dados para sustentar avanço. [Boas práticas Cloud][C08]
 
@@ -2397,54 +2434,150 @@ Para cada query candidata:
 5. Registre a política de replay, retenção e migração.
 6. Meça custo e latência sob o mesmo contrato de resultado.
 
-Queries interativas e pipelines persistentes têm finalidades e ciclo de vida diferentes no serviço. Preserve `INSERT INTO ... SELECT` como a interface do pipeline e versione seus artefatos. [Queries overview Cloud][C10]
+Queries interativas e pipelines persistentes têm finalidades e ciclo de vida diferentes no serviço. Para pipelines longos no Cloud, use a comparação da seção 21.5; no laboratório local, versione o DDL e os `INSERT`s executáveis. [Queries overview Cloud][C10]
 
 Para discutir TCO, compare também estado, retenção Kafka, fan-out, leitura repetida, operação e reconstrução. Não escolha watermark agressivo ou TTL curto apenas para reduzir recursos sem medir a perda de cobertura.
+
+### 21.5. Materialized Tables, CTAS e Statements
+
+“Materialized Table” é um recurso gerenciado do **Confluent Cloud for Apache Flink**. Não é sinônimo de uma tabela comum do Flink, de `CREATE TABLE AS SELECT` (CTAS) nem de um `INSERT` contínuo no Flink local 1.20. A comparação a seguir evita misturar produtos e ciclos de vida. [Materialized Tables][C14], [Statements Cloud][C15]
+
+| Opção | Onde existe | O que passa a ser gerenciado | Use quando | Cuidado |
+| --- | --- | --- | --- | --- |
+| `CREATE TABLE` + `INSERT INTO` | Apache Flink local 1.20 e Cloud | Schema/connector registrado; o `INSERT` submete o job contínuo | Quer controlar explicitamente tópico, formato, watermark e sink; é o padrão recomendado neste Compose | Evolução e substituição do job/tópico ficam por conta do operador |
+| `EXECUTE STATEMENT SET` | Apache Flink SQL, inclusive no laboratório local | Agrupa vários `INSERT`s em um plano/job | A mesma transformação alimenta, por exemplo, saídas de decisão completa e incompleta | Não é um objeto persistente de pipeline e não cria uma estratégia de migração de schema |
+| CTAS (`CREATE TABLE ... AS SELECT`) | SQL Flink onde o conector/catálogo suporta CTAS | Cria uma tabela de destino a partir do resultado da query | Bootstrap rápido ou protótipo cujo schema inferido é aceitável | Schema inferido fica menos explícito; CTAS não fornece o ciclo de evolução do Cloud Materialized Table |
+| Materialized Table | Confluent Cloud for Apache Flink | Objeto declarativo persistente: query contínua, tabela/tópico de saída e schema | Pipeline longo em Cloud que precisa evoluir mantendo o ativo e o tópico de saída | Uma evolução descarta o state e reprocessa conforme `START_MODE`; consumidores append podem ver duplicatas e upsert pode reter chaves que a nova query filtrou |
+| Statement interativo Cloud | Workspace/SQL statements do Cloud | Execução e estado de um statement identificado | Exploração, snapshot/batch e análise interativa | Não escolha como ativo duradouro de produção; statements contínuos têm ciclo de vida próprio e precisam ser geridos |
+
+**Escolha para este repositório:** use DDL explícito em `init.sql` e `INSERT INTO` nos pipelines. O pipeline de decisões usa `EXECUTE STATEMENT SET` porque a mesma agregação de janela alimenta dois tópicos. Esse padrão funciona no Flink local, deixa visíveis os contratos dos sinks e não depende de funcionalidade exclusiva do Cloud.
+
+Exemplo local: registrar a tabela não inicia sozinho uma transformação; o `INSERT` submete a computação contínua. Use a estrutura do pipeline 1 como referência:
+
+```sql
+CREATE TABLE autorizacao_aprovada (
+    id_transacao_pix STRING,
+    event_id STRING,
+    event_time BIGINT,
+    produced_at BIGINT,
+    processed_at TIMESTAMP_LTZ(3)
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'pix.autorizacao.aprovada',
+    'properties.bootstrap.servers' = 'kafka:29092',
+    'format' = 'json'
+);
+
+INSERT INTO autorizacao_aprovada
+SELECT id_transacao_pix, event_id, event_time, produced_at, CURRENT_TIMESTAMP
+FROM autorizacao
+WHERE event_type = 'AUTHORIZATION'
+  AND status_autorizacao = 'APROVADA';
+```
+
+Para duas saídas que compartilham a agregação, o pipeline 3 agrupa os `INSERT`s:
+
+```sql
+EXECUTE STATEMENT SET
+BEGIN
+    INSERT INTO transacao_consolidada SELECT ... FROM pix_decisoes_15s
+      WHERE status_correlacao = 'CONSOLIDATED';
+    INSERT INTO transacao_incompleta SELECT ... FROM pix_decisoes_15s
+      WHERE status_correlacao = 'INCOMPLETE';
+END;
+```
+
+CTAS é uma forma curta de criar o sink e iniciar a query numa única instrução; é útil para protótipo quando os tipos inferidos servem como contrato:
+
+```sql
+CREATE TABLE autorizacao_aprovada_ctas
+WITH (
+    'connector' = 'kafka',
+    'topic' = 'pix.autorizacao.aprovada.ctas',
+    'properties.bootstrap.servers' = 'kafka:29092',
+    'format' = 'json'
+)
+AS
+SELECT id_transacao_pix, event_id, event_time, produced_at
+FROM autorizacao
+WHERE event_type = 'AUTHORIZATION'
+  AND status_autorizacao = 'APROVADA';
+```
+
+O exemplo CTAS cria um sink separado para não competir com o pipeline 1. Em fluxos com contrato estável, prefira o DDL explícito do `init.sql`, revise precisão/nullable no schema e separe o `INSERT` para que registro de tabela e submissão do job fiquem visíveis.
+
+No Cloud, uma Materialized Table junta a query e a tabela de saída num ativo:
+
+```sql
+CREATE MATERIALIZED TABLE pix_auth_approved (
+    id_transacao_pix STRING,
+    event_id STRING,
+    event_time BIGINT,
+    produced_at BIGINT
+)
+AS
+SELECT id_transacao_pix, event_id, event_time, produced_at
+FROM `pix.autorizacao.eventos`
+WHERE event_type = 'AUTHORIZATION'
+  AND status_autorizacao = 'APROVADA';
+```
+
+Quando a regra mudar, a versão Cloud pode ser evoluída no mesmo ativo e tópico:
+
+```sql
+CREATE OR ALTER MATERIALIZED TABLE pix_auth_approved (
+    id_transacao_pix STRING,
+    event_id STRING,
+    event_time BIGINT,
+    produced_at BIGINT
+)
+START_MODE = RESUME_OR_FROM_BEGINNING
+AS
+SELECT id_transacao_pix, event_id, event_time, produced_at
+FROM `pix.autorizacao.eventos`
+WHERE event_type = 'AUTHORIZATION'
+  AND status_autorizacao = 'APROVADA'
+  AND valor >= 100.00;
+```
+
+`CREATE OR ALTER MATERIALIZED TABLE` pode atualizar query/schema mantendo o tópico de saída, mas isso não significa que o state foi migrado. O serviço descarta o state do Flink e reconstrói conforme `START_MODE`; o padrão documentado tenta retomar na evolução e usa o início disponível na criação. Para mudanças que reprocessam o histórico, confira efeitos sobre duplicatas/upserts e retenção da origem antes de evoluir o pipeline. [CREATE MATERIALIZED TABLE][C16], [CREATE OR ALTER MATERIALIZED TABLE][C17]
+
+Essa sintaxe **não roda no Flink local 1.20 deste projeto**. Ela é uma comparação de destino para Cloud; os scripts executáveis continuam usando `CREATE TABLE`, `INSERT INTO` e `STATEMENT SET`.
 
 
 ## 22. Roteiro de estudos e resultados esperados
 
 ### 22.1. Mapa dos scripts
 
-| Arquivo sugerido em `flink/sql/studies/` | Bloco do guia | Evidência de aprendizado |
+| Arquivo que existe em `flink/studies/` | Abordagem Flink | O que observar |
 | --- | --- | --- |
-| `01-inspect-sources.sql` | 7.1 | Tipos, campos e offsets corretos |
-| `02-basic-queries.sql` | 7.2–7.4 | Projeção, filtro, CTE e conjuntos |
-| `03-rowtime.sql` | 8.1–8.2 | Rowtime reconhecido no plano |
-| `04-watermark.sql` | 9.4 | WM observado e tratamento de NULL |
-| `05-latency.sql` | 9.7 | Medidas de atraso separadas |
-| `06-tumble.sql` | 10.3 | Resultado final por bucket |
-| `07-hop.sql` | 10.4 | Participação em janelas sobrepostas |
-| `08-cumulate.sql` | 10.5 | Acumulados com início comum |
-| `09-session.sql` | 10.6 | Fechamento por gap, com extensão |
-| `10-cascade.sql` | 10.7 | Propagação de `window_time` |
-| `11-over.sql` | 11.2–11.3 | RANGE, ROWS e peers |
-| `12-dedup.sql` | 12.1–12.3 | Identidade, janela e versão |
-| `13-regular-join.sql` | 13.2 | Cardinalidade sem horizonte |
-| `14-interval-join.sql` | 13.3–13.4 | Bounds e âncora |
-| `15-window-join.sql` | 13.5 | Igualdades de fronteira e saída final |
-| `16-temporal-join.sql` | 13.7 | Versão histórica da dimensão |
-| `17-lookup-join.sql` | 13.8 | Consulta externa e seus pré-requisitos |
-| `18-topn.sql` | 17.1–17.2 | Ranking contínuo e por janela |
-| `19-match-recognize.sql` | 17.3 | Sequência estrita dentro do intervalo |
-| `20-explain.sql` | 19.1 | Operadores e changelog planejados |
+| `tumble01.sql` a `tumble03.sql` | TUMBLE + agregação | Bucket fixo, contagem e fechamento por watermark |
+| `hop01.sql` a `hop10.sql` | HOP | Sobreposição, tamanho e passo de janela |
+| `cumulate.sql` | CUMULATE | Acumulado em múltiplas fronteiras a partir do mesmo início |
+| `window_aggregation.sql` | Window Aggregation | Agregação fechada por tempo de evento |
+| `regular_join.sql` | Regular Join | Cardinalidade e estado sem limite temporal |
+| `interval_join.sql` | Interval Join | Âncora, limites e horizonte event-time |
+| `window_join.sql` | Window Join | Igualdade de `window_start`/`window_end` e multiplicação de linhas |
+| `statefull.sql` / `stateless.sql` | Stateful / stateless | Diferença entre transformação por registro e estado por chave |
 
-Execute um SELECT streaming exploratório por vez. Um arquivo com vários SELECTs unbounded pode permanecer na primeira coleta; copie a query desejada ou divida os estudos. Inicialize previamente as tabelas extras de upsert, dimensão ou Avro quando o exercício as exigir.
+O guia também traz exemplos inline de `OVER`, deduplicação, Temporal/Lookup Join, Top-N e `MATCH_RECOGNIZE`; estes tópicos ainda não têm um arquivo próprio em `flink/studies/`. Execute uma query streaming exploratória por vez. O catálogo do SQL Client é de sessão, então carregue `init.sql` ao abrir uma sessão nova.
 
 | Pipeline em `flink/sql/pipelines/` | Destino | Garantia funcional do exemplo |
 | --- | --- | --- |
 | `01-auth-approved.sql` | `pix.autorizacao.aprovada` | Filtro por status |
 | `02-auth-metrics-15s.sql` | `pix.autorizacao.metricas` | Métricas de registros por janela |
-| `03-pix-decisoes-window.sql` | Consolidada e incompleta | Presença das três origens no bucket fechado |
+| `03-pix-decisoes-window.sql` | `pix.transacao.consolidada.presenca.v2` e `pix.transacao.incompleta.presenca.v2` | Presença das três origens no bucket fechado |
 | `04-late-diagnostic.sql` | `pix.transacao.late-events` | Observação de atraso no próprio plano |
 
 ### 22.2. Rotina operacional
 
-Subir os serviços do Compose existente:
+Subir o ambiente local sem o gerador aleatório (que é opcional):
 
 ```bash
 docker compose up -d --build
 ```
+
+Para gerar tráfego aleatório de demonstração, inicie-o separadamente: `docker compose --profile random up -d pix-datagen`. Pause-o antes de rodar fixtures para que não misture eventos no mesmo tópico.
 
 Confira os serviços e o registro do TaskManager antes de abrir o cliente:
 
@@ -2452,7 +2585,7 @@ Confira os serviços e o registro do TaskManager antes de abrir o cliente:
 docker compose ps
 ```
 
-Submeter o pipeline de decisões:
+Submeter o pipeline de decisões (em um cluster/tópicos limpos ou depois de escolher o offset inicial apropriado):
 
 ```bash
 docker compose run --rm \
@@ -2477,7 +2610,7 @@ Consumir incompletos:
 ```bash
 docker compose exec kafka kafka-console-consumer \
   --bootstrap-server kafka:29092 \
-  --topic pix.transacao.incompleta \
+  --topic pix.transacao.incompleta.presenca.v2 \
   --from-beginning \
   --consumer-property isolation.level=read_committed
 ```
@@ -2492,39 +2625,39 @@ Não submeta novamente um pipeline só porque fechou o terminal do cliente. Prim
 
 ### 22.3. Contrato do datagen para os estudos
 
-O datagen deve permitir controlar as propriedades abaixo. O guia descreve o comportamento necessário; os parâmetros reais dependem da implementação atual do projeto.
+O serviço `pix-datagen` é o gerador aleatório, contínuo e voltado à demonstração. Ele agora é opcional (`--profile random`) para não interferir com os casos controlados. `pix_fixture_producer.py` publica uma única fixture e registros de controle de event time em cada partição das três fontes.
 
 | Controle | Para que serve |
 | --- | --- |
-| IDs reproduzíveis por cenário | Comparar entradas e saídas |
+| `--run-id` no produtor de fixture | Repetir uma execução com a mesma identidade de negócio |
 | Chave Kafka = `id_transacao_pix` | Observar particionamento relacionado à transação |
 | Event time separado do envio | Produzir atrasos e inversões |
 | Atrasos típicos de 4/6/10 s | Reproduzir o cenário AUTH/LIQ/FRAUD do projeto |
-| Omissão de uma origem | Validar incompletos |
-| Reenvio do mesmo evento | Validar dedup e presença |
-| Nova versão legítima | Separar correção de retransmissão |
-| Escolha explícita de partição no teste | Controlar o progresso por partição |
-| Pausa por origem e pausa total | Testar idleness e ausência de progresso |
-| Registros posteriores de controle | Avançar o watermark para fechar janelas |
-| Modo JSON/Avro | Validar serialização, sem misturar o histórico |
+| `--scenario missing-fraud` | Validar uma decisão incompleta por origem ausente |
+| `--scenario duplicate-auth` | Repetir o mesmo `event_id` sem confundir duplicata com nova versão |
+| `--scenario out-of-order` | Publicar fora da ordem de negócio e observar admissibilidade temporal |
+| `--scenario late-after-close` | Enviar AUTH depois que os controles avançaram o watermark |
+| Controles enviados a cada partição | Permitir que o menor watermark de cada fonte avance |
+| Tópico `.avro` separado | Testar serialização sem misturar bytes Avro com histórico JSON |
 
 Os atrasos de 4/6/10 s podem representar latência de publicação ou instantes de ocorrência de etapas diferentes. Declare qual interpretação o cenário usa; a posição na janela depende de event time, não do tempo de espera do script.
 
 ### 22.4. Fixtures temporais
 
-Considere `T0 = 2026-09-15 12:00:00 UTC`, equivalente a `1789473600000` ms. Os números a seguir são segundos relativos a T0, com watermark configurado em 5 s.
+O produtor escolhe a próxima janela TUMBLE de 15 segundos no futuro e imprime os milissegundos usados. O watermark local está configurado com tolerância de 5 segundos.
 
-**Procedimento proposto:** execute cada cenário em entradas isoladas, sem um datagen aleatório concorrente. Publique primeiro as evidências descritas; só depois envie registros de controle com timestamps posteriores, por exemplo T0 + 30 s, em todas as partições/fontes que devem avançar. Observe o watermark do operador antes de afirmar que a janela fechou.
+**Procedimento:** confirme que o datagen aleatório está parado, depois publique um cenário com `docker compose run --rm pix-datagen python -u pix_fixture_producer.py --scenario normal --run-id caso-01 --bootstrap-servers kafka:29092`. Os registros `CTRL-*` avançam todas as partições; exclua esses IDs ao comparar os resultados da transação-alvo. Observe o watermark do operador antes de afirmar que a janela fechou.
 
 Os controles devem usar IDs próprios, como `CTRL-*`, e não entrar na comparação das transações-alvo. Não remova esses registros antes da fonte gerar o progresso que o teste precisa observar.
 
 | Caso | Entradas da transação-alvo | Resultado esperado |
 | --- | --- | --- |
-| T01 — normal | AUTH 4, LIQ 6, FRAUD 10 | Uma decisão CONSOLIDATED no bucket `[0,15)` |
-| T02 — chegada invertida | Mesmos timestamps de T01; publicar FRAUD, AUTH, LIQ | Mesmo conteúdo de presença de T01, se as evidências forem admitidas |
-| T03 — fonte ausente | AUTH 2, LIQ 8; nenhum FRAUD | INCOMPLETE com `FRAUD;` após fechamento |
-| T04 — três cópias | AUTH 2 repetido três vezes, mesmo ID | INCOMPLETE, 3 registros, 1 ID distinto |
-| T05 — duplicata de FRAUD | AUTH 4, LIQ 6, FRAUD 10 duas vezes | CONSOLIDATED, 4 registros, 3 IDs distintos |
+| normal | AUTH +2 s, LIQ +6 s, FRAUD +10 s | CONSOLIDATED; controle posterior fecha o bucket |
+| missing-fraud | AUTH +2 s, LIQ +6 s | INCOMPLETE com `FRAUD;` |
+| duplicate-auth | AUTH +2 s duas vezes com mesmo `event_id`, LIQ +6 s, FRAUD +10 s | CONSOLIDATED; contagem 4 e 3 IDs distintos |
+| out-of-order | Publicação FRAUD, AUTH, LIQ; mesmos tempos do normal | CONSOLIDATED se as evidências chegarem antes do fechamento |
+| late-after-close | normal, controles em todas as partições, depois AUTH antiga | A primeira decisão já foi fechada; a evidência tardia chega após o watermark |
+| Próximos casos | T06–T27 abaixo | Permanecem como exercícios manuais, não como cenários do produtor |
 | T06 — quebra de bucket | AUTH 13, LIQ 17, FRAUD 20 | Duas decisões incompletas por TUMBLE; match no Interval Join ancorado |
 | T07 — fronteira exata | AUTH 14.999, LIQ 15.000, FRAUD 15.001 | AUTH fica no bucket anterior |
 | T08 — nada observado | Nenhuma evidência da transação | Nenhuma decisão; requer universo de esperados |
@@ -2607,10 +2740,10 @@ A evolução para Confluent Cloud deve conservar esses contratos e adaptar catá
 
 | Material | Uso nesta revisão |
 | --- | --- |
-| `guia-laboratorio-kafka-flink.md` | Documento-base e histórico de comandos/erros |
-| `guia-queries-flink-sql-confluent-cloud.md` | Cobertura do catálogo de consultas e distinções do SaaS |
-| `guia-industrializacao-flink-sql-confluent-cloud.md` | Contratos, determinismo, completude, operação e migração |
-| Texto fornecido na solicitação | Escopo de ampliação e exemplos locais a revisar |
+| `README.md` | Guia principal e exemplos de queries, operação e Cloud |
+| `flink/studies/*.sql` e `flink/studies/tumble_vs_hop.md` | Estudos existentes e suas diferenças temporais |
+| `flink/sql/init.sql` e `flink/sql/pipelines/*.sql` | DDLs executáveis e fluxos contínuos |
+| `docker-compose.yml` e `datagen/*.py` | Ambiente local, gerador aleatório e fixtures determinísticas |
 
 Os materiais de fundamentos Flink 2.3 do projeto continuam úteis conceitualmente. Eles não alteram a versão-alvo dos SQLs locais deste guia: **Flink 1.20**.
 
@@ -2647,7 +2780,7 @@ Os materiais de fundamentos Flink 2.3 do projeto continuam úteis conceitualment
 
 ### 25.3. Confluent — documentação oficial consultada
 
-As páginas `current` descrevem o estado consultado em **15 de setembro de 2026** e podem mudar.
+As páginas `current` descrevem o estado consultado em **27 de outubro de 2026** e podem mudar.
 
 | ID | Referência | Aplicação principal |
 | --- | --- | --- |
@@ -2664,6 +2797,10 @@ As páginas `current` descrevem o estado consultado em **15 de setembro de 2026*
 | C11 | [Windowing TVFs Cloud][C11] | Consulta de compatibilidade no destino |
 | C12 | [Joins Cloud][C12] | Famílias de joins no SaaS |
 | C13 | [ALTER TABLE Cloud][C13] | Alterações de watermark e propriedades |
+| C14 | [Materialized Tables Cloud][C14] | Pipeline contínuo persistente e limitações de evolução |
+| C15 | [Statements Cloud][C15] | Escolha entre queries interativas e pipelines longos |
+| C16 | [CREATE MATERIALIZED TABLE][C16] | Syntax, schema e START_MODE |
+| C17 | [CREATE OR ALTER MATERIALIZED TABLE][C17] | Evolução in-place, replay e impacto nos consumidores |
 | P01 | [Docker Image Configuration][P01] | KRaft no ambiente local |
 | P02 | [Schema Evolution and Compatibility][P02] | Compatibilidade por formato e versão |
 | P03 | [Confluent Kafka Python API][P03] | AvroSerializer e produção |
@@ -2721,6 +2858,10 @@ As páginas `current` descrevem o estado consultado em **15 de setembro de 2026*
 [C11]: https://docs.confluent.io/cloud/current/flink/reference/queries/window-tvf.html
 [C12]: https://docs.confluent.io/cloud/current/flink/reference/queries/joins.html
 [C13]: https://docs.confluent.io/cloud/current/flink/reference/statements/alter-table.html
+[C14]: https://docs.confluent.io/cloud/current/flink/concepts/materialized-tables.html
+[C15]: https://docs.confluent.io/cloud/current/flink/concepts/statements.html
+[C16]: https://docs.confluent.io/cloud/current/flink/reference/statements/create-materialized-table.html
+[C17]: https://docs.confluent.io/cloud/current/flink/reference/statements/create-or-alter-materialized-table.html
 [P01]: https://docs.confluent.io/platform/current/installation/docker/config-reference.html
 [P02]: https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
 [P03]: https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html

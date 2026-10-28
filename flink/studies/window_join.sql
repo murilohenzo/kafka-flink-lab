@@ -3,7 +3,7 @@ WITH autorizacao_window AS (
     FROM TABLE(
         TUMBLE(
             TABLE autorizacao,
-            DESCRIPTOR(rowtime),
+            DESCRIPTOR(event_ts),
             INTERVAL '15' SECOND
         )
     )
@@ -14,7 +14,7 @@ antifraude_window AS (
     FROM TABLE(
         TUMBLE(
             TABLE antifraude,
-            DESCRIPTOR(rowtime),
+            DESCRIPTOR(event_ts),
             INTERVAL '15' SECOND
         )
     )
@@ -25,8 +25,8 @@ SELECT
     a.event_id AS autorizacao_event_id,
     af.event_id AS antifraude_event_id,
 
-    a.rowtime AS autorizacao_time,
-    af.rowtime AS antifraude_time,
+    a.event_ts AS autorizacao_time,
+    af.event_ts AS antifraude_time,
 
     a.window_start,
     a.window_end
@@ -47,7 +47,7 @@ WITH autorizacao_window AS (
     FROM TABLE(
         TUMBLE(
             TABLE autorizacao,
-            DESCRIPTOR(rowtime),
+            DESCRIPTOR(event_ts),
             INTERVAL '15' SECOND
         )
     )
@@ -58,7 +58,7 @@ antifraude_window AS (
     FROM TABLE(
         TUMBLE(
             TABLE antifraude,
-            DESCRIPTOR(rowtime),
+            DESCRIPTOR(event_ts),
             INTERVAL '15' SECOND
         )
     )
@@ -69,7 +69,7 @@ liquidacao_window AS (
     FROM TABLE(
         TUMBLE(
             TABLE liquidacao,
-            DESCRIPTOR(rowtime),
+            DESCRIPTOR(event_ts),
             INTERVAL '15' SECOND
         )
     )
@@ -82,9 +82,9 @@ SELECT
     af.event_id AS antifraude_event_id,
     l.event_id AS liquidacao_event_id,
 
-    a.rowtime AS autorizacao_time,
-    af.rowtime AS antifraude_time,
-    l.rowtime AS liquidacao_time,
+    a.event_ts AS autorizacao_time,
+    af.event_ts AS antifraude_time,
+    l.event_ts AS liquidacao_time,
 
     a.window_start,
     a.window_end

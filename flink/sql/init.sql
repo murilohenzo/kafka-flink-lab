@@ -213,6 +213,8 @@ CREATE TABLE autorizacao_aprovada (
 
     event_time BIGINT,
 
+    produced_at BIGINT,
+
     processed_at TIMESTAMP_LTZ(3)
 
 )
@@ -224,7 +226,9 @@ WITH (
 
     'properties.bootstrap.servers' = 'kafka:29092',
 
-    'format' = 'json'
+    'format' = 'json',
+
+    'sink.delivery-guarantee' = 'at-least-once'
 
 );
 
@@ -236,13 +240,13 @@ WITH (
 
 CREATE TABLE autorizacao_metricas (
 
-    window_start TIMESTAMP(3),
+    window_start TIMESTAMP_LTZ(3),
 
-    window_end TIMESTAMP(3),
+    window_end TIMESTAMP_LTZ(3),
 
     quantidade BIGINT,
 
-    valor_total DECIMAL(20, 2)
+    valor_total DECIMAL(38, 2)
 
 )
 WITH (
@@ -253,7 +257,9 @@ WITH (
 
     'properties.bootstrap.servers' = 'kafka:29092',
 
-    'format' = 'json'
+    'format' = 'json',
+
+    'sink.delivery-guarantee' = 'at-least-once'
 
 );
 
@@ -267,34 +273,46 @@ CREATE TABLE transacao_consolidada (
 
     id_transacao_pix STRING,
 
-    valor DECIMAL(12, 2),
+    window_start TIMESTAMP_LTZ(3),
 
-    status_autorizacao STRING,
+    window_end TIMESTAMP_LTZ(3),
 
-    status_liquidacao STRING,
+    tem_auth INT,
 
-    status_antifraude STRING,
+    tem_liq INT,
 
-    score_risco DOUBLE,
+    tem_fraud INT,
 
-    authorization_event_id STRING,
+    qtd_registros BIGINT,
 
-    settlement_event_id STRING,
+    qtd_eventos_distintos BIGINT,
 
-    fraud_event_id STRING,
+    status_correlacao STRING,
 
-    consolidated_at TIMESTAMP_LTZ(3)
+    origens_faltantes STRING,
+
+    versao_politica STRING,
+
+    emitido_em TIMESTAMP_LTZ(3)
 
 )
 WITH (
 
     'connector' = 'kafka',
 
-    'topic' = 'pix.transacao.consolidada',
+    'topic' = 'pix.transacao.consolidada.presenca.v2',
 
     'properties.bootstrap.servers' = 'kafka:29092',
 
-    'format' = 'json'
+    'key.format' = 'raw',
+
+    'key.fields' = 'id_transacao_pix',
+
+    'value.format' = 'json',
+
+    'value.fields-include' = 'ALL',
+
+    'sink.delivery-guarantee' = 'at-least-once'
 
 );
 
@@ -308,26 +326,46 @@ CREATE TABLE transacao_incompleta (
 
     id_transacao_pix STRING,
 
-    missing_sources STRING,
-
     window_start TIMESTAMP_LTZ(3),
 
     window_end TIMESTAMP_LTZ(3),
 
-    reason STRING,
+    tem_auth INT,
 
-    detected_at TIMESTAMP_LTZ(3)
+    tem_liq INT,
+
+    tem_fraud INT,
+
+    qtd_registros BIGINT,
+
+    qtd_eventos_distintos BIGINT,
+
+    status_correlacao STRING,
+
+    origens_faltantes STRING,
+
+    versao_politica STRING,
+
+    emitido_em TIMESTAMP_LTZ(3)
 
 )
 WITH (
 
     'connector' = 'kafka',
 
-    'topic' = 'pix.transacao.incompleta',
+    'topic' = 'pix.transacao.incompleta.presenca.v2',
 
     'properties.bootstrap.servers' = 'kafka:29092',
 
-    'format' = 'json'
+    'key.format' = 'raw',
+
+    'key.fields' = 'id_transacao_pix',
+
+    'value.format' = 'json',
+
+    'value.fields-include' = 'ALL',
+
+    'sink.delivery-guarantee' = 'at-least-once'
 
 );
 
@@ -343,13 +381,17 @@ CREATE TABLE transacao_late_events (
 
     event_id STRING,
 
-    event_type STRING,
+    origem STRING,
 
     event_time BIGINT,
 
-    detected_watermark TIMESTAMP_LTZ(3),
+    produced_at BIGINT,
 
-    detected_at TIMESTAMP_LTZ(3)
+    watermark_observado TIMESTAMP_LTZ(3),
+
+    classificacao STRING,
+
+    observado_em TIMESTAMP_LTZ(3)
 
 )
 WITH (
@@ -360,6 +402,64 @@ WITH (
 
     'properties.bootstrap.servers' = 'kafka:29092',
 
-    'format' = 'json'
+    'format' = 'json',
+
+    'sink.delivery-guarantee' = 'at-least-once'
 
 );
+
+
+-- ============================================================
+-- VIEW NORMALIZADA
+-- Uma linha por evidência, preservando a propriedade event_ts.
+-- ============================================================
+
+CREATE TEMPORARY VIEW pix_evidencias AS
+SELECT
+    id_transacao_pix,
+    event_id,
+    event_version,
+    'AUTH' AS origem,
+    status_autorizacao AS status_evento,
+    event_time,
+    produced_at,
+    event_ts
+FROM autorizacao
+WHERE id_transacao_pix IS NOT NULL
+  AND event_id IS NOT NULL
+  AND event_time IS NOT NULL
+  AND event_type = 'AUTHORIZATION'
+
+UNION ALL
+
+SELECT
+    id_transacao_pix,
+    event_id,
+    event_version,
+    'LIQ' AS origem,
+    status_liquidacao AS status_evento,
+    event_time,
+    produced_at,
+    event_ts
+FROM liquidacao
+WHERE id_transacao_pix IS NOT NULL
+  AND event_id IS NOT NULL
+  AND event_time IS NOT NULL
+  AND event_type = 'SETTLEMENT'
+
+UNION ALL
+
+SELECT
+    id_transacao_pix,
+    event_id,
+    event_version,
+    'FRAUD' AS origem,
+    status_antifraude AS status_evento,
+    event_time,
+    produced_at,
+    event_ts
+FROM antifraude
+WHERE id_transacao_pix IS NOT NULL
+  AND event_id IS NOT NULL
+  AND event_time IS NOT NULL
+  AND event_type = 'FRAUD';

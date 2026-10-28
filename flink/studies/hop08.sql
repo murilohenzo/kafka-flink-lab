@@ -58,7 +58,7 @@ FROM TABLE(
     HOP(
         TABLE autorizacao,
 
-        -- Event Time / ROWTIME.
+        -- Event Time / event_ts.
         DESCRIPTOR(event_ts),
 
         -- Uma nova janela é iniciada a cada 5 segundos.

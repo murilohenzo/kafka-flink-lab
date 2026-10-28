@@ -7,9 +7,9 @@ SELECT
     a.event_id AS autorizacao_event_id,
     af.event_id AS antifraude_event_id,
     l.event_id AS liquidacao_event_id,
-    a.rowtime AS autorizacao_time,
-    af.rowtime AS antifraude_time,
-    l.rowtime AS liquidacao_time
+    a.event_ts AS autorizacao_time,
+    af.event_ts AS antifraude_time,
+    l.event_ts AS liquidacao_time
 FROM autorizacao AS a
 JOIN antifraude AS af
     ON a.id_transacao_pix = af.id_transacao_pix

@@ -1,0 +1,23 @@
+{
+  "type": "record",
+  "name": "AuthorizationEvent",
+  "namespace": "br.com.novapay.pix.lab",
+  "fields": [
+    {"name": "id_transacao_pix", "type": "string"},
+    {"name": "event_id", "type": "string"},
+    {"name": "event_type", "type": "string"},
+    {"name": "event_version", "type": "int"},
+    {
+      "name": "valor",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 12,
+        "scale": 2
+      }
+    },
+    {"name": "status_autorizacao", "type": "string"},
+    {"name": "event_time", "type": "long"},
+    {"name": "produced_at", "type": "long"}
+  ]
+}

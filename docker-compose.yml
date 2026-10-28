@@ -139,11 +139,16 @@ services:
 
         # ======================================================
         # OUTPUT DO FLUXO PIX
+        # Os dois primeiros tópicos são contratos legados. Os pipelines
+        # desta revisão publicam nos tópicos presenca.v2 abaixo.
         # ======================================================
 
         create_topic pix.transacao.consolidada 3
         create_topic pix.transacao.incompleta 3
         create_topic pix.transacao.late-events 3
+        create_topic pix.transacao.consolidada.presenca.v2 3
+        create_topic pix.transacao.incompleta.presenca.v2 3
+        create_topic pix.autorizacao.eventos.avro 3
 
         # ======================================================
         # LISTAGEM
@@ -231,8 +236,13 @@ services:
   # ============================================================
 
   pix-datagen:
-    image: python:3.12-slim
+    build:
+      context: ./datagen
+      dockerfile: Dockerfile
     container_name: pix-datagen
+
+    profiles:
+      - random
 
     depends_on:
       kafka:
@@ -259,11 +269,7 @@ services:
 
       MAX_ARRIVAL_DELAY_SECONDS: "12"
 
-    command: >
-      sh -c "
-      pip install --no-cache-dir confluent-kafka==2.6.1 &&
-      python -u pix_datagen.py
-      "
+    command: python -u pix_datagen.py
 
     restart: unless-stopped
 
@@ -325,6 +331,12 @@ services:
 
         parallelism.default: 3
 
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
+
         # ------------------------------------------------------
         # State
         # ------------------------------------------------------
@@ -383,6 +395,12 @@ services:
         taskmanager.numberOfTaskSlots: 4
 
         parallelism.default: 3
+
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
 
         # ------------------------------------------------------
         # State
@@ -455,6 +473,9 @@ services:
         # ------------------------------------------------------
 
         parallelism.default: 3
+
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
 
     command:
       - /opt/flink/bin/sql-client.sh

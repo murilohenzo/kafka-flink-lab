@@ -86,7 +86,7 @@
 -- Importante:
 --
 -- `window_start` e `window_end` descrevem os limites da janela,
--- mas não preservam por si mesmos o atributo ROWTIME para operações
+-- mas não preservam por si mesmos o atributo event_ts para operações
 -- temporais subsequentes.
 --
 -- Para encadear outra operação baseada em tempo, normalmente
@@ -130,7 +130,7 @@ FROM TABLE(
     TUMBLE(
         TABLE autorizacao,
 
-        -- ROWTIME utilizado para atribuição temporal.
+        -- event_ts utilizado para atribuição temporal.
         DESCRIPTOR(event_ts),
 
         -- Janela fixa e não sobreposta de 15 segundos.

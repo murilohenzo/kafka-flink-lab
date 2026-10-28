@@ -115,7 +115,7 @@ FROM TABLE(
     HOP(
         TABLE autorizacao,
 
-        -- ROWTIME utilizado para determinar a posição temporal
+        -- event_ts utilizado para determinar a posição temporal
         -- do evento.
         DESCRIPTOR(event_ts),
 
